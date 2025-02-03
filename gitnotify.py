@@ -1,5 +1,7 @@
+import sys
+from ctraceback import CTraceback
+sys.excepthook = CTraceback()
 from github import Github
-# import gntp.notifier
 import time
 from pathlib import Path
 from configset import configset
@@ -7,7 +9,7 @@ from rich.console import Console
 console = Console()
 from sendgrowl import Growl
 from datetime import datetime
-import sys
+
 import os
 import signal
 from gntplib import Publisher, SocketCallback
@@ -82,7 +84,7 @@ def monitor(max_try = 2):
         os.kill(os.getpid(), signal.SIGTERM)            
     max_try = max_try or CONFIG.get_config('try', 'max') or 2
     for notification in notifications:
-        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
+        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
         # n = 1
         # try:
         #     while 1:
@@ -114,6 +116,7 @@ def monitor(max_try = 2):
             except Exception as e:
                 if not str(e).lower() == 'timed out':
                     console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
+                    
             notification_dones.append(notification.subject.title)
 
 def main():
