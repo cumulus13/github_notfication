@@ -84,40 +84,27 @@ def monitor(max_try = 2):
         os.kill(os.getpid(), signal.SIGTERM)            
     max_try = max_try or CONFIG.get_config('try', 'max') or 2
     for notification in notifications:
-        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
-        # n = 1
-        # try:
-        #     while 1:
-        #         try:
-        #             NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = True)
-        #             break
-        #         except Exception as e:
-        #             console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e} ({n})][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
-        #             if not n == max_try:
-        #                 n += 1
-        #             else:
-        #                 break
+        if CONFIG.get_config_as_list('subject', 'exceptions') and list(filter(lambda k: k.lower() in notification.repository.full_name.lower(), CONFIG.get_config_as_list('subject', 'exceptions'))):
+            console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
+            if CONFIG.get_config('status', 'clear') == 1:
+                notification_dones = []
+                CONFIG.write_config('status', 'clear', '0')         
+                if sys.platform == 'win32':
+                    os.system('cls')
+                else:
+                    os.system('clear')
                     
-        # except KeyboardInterrupt:
-        #     os.kill(os.getpid(), signal.SIGTERM)            
-        # except Exception as e:
-        #     console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
-        if CONFIG.get_config('status', 'clear') == 1:
-           notification_dones = []
-           CONFIG.write_config('status', 'clear', '0')         
-           if sys.platform == 'win32':
-               os.system('cls')
-           else:
-               os.system('clear')
-               
-        if not notification.subject.title in notification_dones:
-            try:
-                NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = False)
-            except Exception as e:
-                if not str(e).lower() == 'timed out':
-                    console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
-                    
-            notification_dones.append(notification.subject.title)
+            if not notification.subject.title in notification_dones:
+                try:
+                    NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = False)
+                except Exception as e:
+                    if not str(e).lower() == 'timed out':
+                        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
+                        
+                notification_dones.append(notification.subject.title)
+        else:
+            notification.mark_as_read()            
+    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFAA00]END monitoring ...[/]")
 
 def main():
     try:
@@ -130,4 +117,5 @@ def main():
         console.log(f"[white on red]{e}[/]")
         
 if __name__ == "__main__":
-    monitor()
+    # monitor()
+    main()
