@@ -96,7 +96,7 @@ def monitor(max_try = 2):
                     
             if not notification.subject.title in notification_dones:
                 try:
-                    NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = False)
+                    NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = CONFIG.get_config('growl', 'sticky') or False)
                 except Exception as e:
                     if not str(e).lower() == 'timed out':
                         console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
