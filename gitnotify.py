@@ -109,8 +109,16 @@ def monitor(max_try = 2):
 def main():
     try:
         while True:
-            monitor()
-            time.sleep(CONFIG.get_config('interval', 'seconds') or CHECK_INTERVAL or 60)
+            try:
+                monitor()
+                time.sleep(CONFIG.get_config('interval', 'seconds') or CHECK_INTERVAL or 60)
+            except KeyboardInterrupt:
+                os.kill(os.getpid(), signal.SIGTERM)        
+            except Exception as e:
+                console.log(f"[white on red]{e}[/]")
+                if "HTTPSConnectionPool" in str(e): console.log("[black on #FFFF00]re-connection ...[/]")
+                time.sleep(5)
+            
     except KeyboardInterrupt:
         os.kill(os.getpid(), signal.SIGTERM)        
     except Exception as e:
