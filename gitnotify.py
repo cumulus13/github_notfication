@@ -7,8 +7,9 @@ from pathlib import Path
 from configset import configset
 from rich.console import Console
 console = Console()
-from sendgrowl import Growl
+# from sendgrowl import Growl
 from datetime import datetime
+from pydebugger.debug import debug
 
 import os
 import signal
@@ -75,6 +76,7 @@ def monitor(max_try = 2):
     console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFFF00]START monitoring ...[/]")
     github_client = Github(GITHUB_ACCESS_TOKEN)
     notifications = github_client.get_user().get_notifications()
+    if os.getenv('VERBOSE') == '1': debug(notifications = notifications, debug = 1)
     notification_dones = []    
     NOTIFY = Publisher('Github Notify', ['New Notification'], icon = str(Path(__file__).parent / 'icon.png'))
     try:
@@ -84,7 +86,9 @@ def monitor(max_try = 2):
         os.kill(os.getpid(), signal.SIGTERM)            
     max_try = max_try or CONFIG.get_config('try', 'max') or 2
     for notification in notifications:
-        if CONFIG.get_config_as_list('subject', 'exceptions') and list(filter(lambda k: k.lower() in notification.repository.full_name.lower(), CONFIG.get_config_as_list('subject', 'exceptions'))):
+        if os.getenv('VERBOSE') == '1':
+            console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
+        if CONFIG.get_config_as_list('subject', 'exceptions') and not list(filter(lambda k: k.lower() in notification.repository.full_name.lower(), CONFIG.get_config_as_list('subject', 'exceptions'))):
             console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
             if CONFIG.get_config('status', 'clear') == 1:
                 notification_dones = []
@@ -94,7 +98,7 @@ def monitor(max_try = 2):
                 else:
                     os.system('clear')
                     
-            if not notification.subject.title in notification_dones:
+            if not notification.subject.title in notification_dones and not CONFIG.get_config('subject', 'always'):
                 try:
                     NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = CONFIG.get_config('growl', 'sticky') or False)
                 except Exception as e:
@@ -102,8 +106,16 @@ def monitor(max_try = 2):
                         console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
                         
                 notification_dones.append(notification.subject.title)
+            else:
+                try:
+                    NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = CONFIG.get_config('growl', 'sticky') or False)
+                except Exception as e:
+                    if not str(e).lower() == 'timed out':
+                        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
+                
         else:
             notification.mark_as_read()            
+    
     console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFAA00]END monitoring ...[/]")
 
 def main():
