@@ -15,3 +15,14 @@ build/
 traceback.log
 __pycache__/
 *.ini
+
+# Added entries (1 items)
+*sublime*
+# PT backup directory
+.pt/
+
+# Added entries (1 items)
+*.0
+
+# Added entries (1 items)
+*.1

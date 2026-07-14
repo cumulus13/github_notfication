@@ -1,141 +1,398 @@
-import sys
-from ctraceback import CTraceback
-sys.excepthook = CTraceback()
-from github import Github
-import time
-from pathlib import Path
-from configset import configset
-from rich.console import Console
-console = Console()
-# from sendgrowl import Growl
-from datetime import datetime
-from pydebugger.debug import debug
+#!/usr/bin/env python3
 
+# File: gitnotify.py
+# Author: Hadi Cahyadi <cumulus13@gmail.com>
+# Date: 2026-04-28
+# Description: Production-grade CLI tool for monitoring new GitHub notifications
+#              and pushing desktop alerts via GNTP.
+# License: MIT
+#
+# gitnotify.ini keys:
+#   [auth]     token       = classic PAT with the "notifications" scope
+#   [interval] seconds     = polling interval in seconds (default 60)
+#   [growl]    host        = comma-separated GNTP hosts (default 127.0.0.1)
+#   [growl]    sticky      = 1/0, sticky GNTP notifications
+#   [subject]  exceptions  = comma-separated repo full_name substrings to IGNORE
+#   [subject]  always      = 1/0, re-notify even if already seen this run
+#   [try]      max         = max GNTP register attempts per host (default 2)
+#   [status]   clear       = 1 to clear the "seen" cache + screen on next cycle
+
+import argparse
+import logging
 import os
 import signal
-from gntplib import Publisher, SocketCallback
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
-class Callback(SocketCallback):
-    def __init__(self, notification):
-        SocketCallback.__init__(self, notification)
-    def on_click(self, response):
-        self.context.mark_as_read()
+import requests
+from configset import configset
+from github import Github
+from github.GithubException import (
+    BadCredentialsException,
+    GithubException,
+    RateLimitExceededException,
+    TwoFactorException,
+)
+from rich.console import Console
+from rich.logging import RichHandler
 
-# Configuration
-CONFIG = configset(str(Path.cwd() / 'gitnotify.ini') if (Path(__file__).parent / 'gitnotify.ini').is_file() else str(Path(__file__).parent / 'gitnotify.ini'))
-GITHUB_ACCESS_TOKEN = CONFIG.get_config('auth', 'token') or os.getenv('GITHUB_TOKEN') or console.input(f"[white on red]TOKEN:[/] ")
-if GITHUB_ACCESS_TOKEN and GITHUB_ACCESS_TOKEN.strip().lower() in ['q', 'quit', 'exit', 'x']: os.kill(os.getpid(), signal.SIGTERM)
-ERROR = False
-if not GITHUB_ACCESS_TOKEN:
-    while 1:
-        GITHUB_ACCESS_TOKEN = CONFIG.get_config('auth', 'token') or console.input(f"[#00FFFF bold]x|exit|q|quit = exit/quit[/] [white on red]TOKEN:[/] ")
-        if GITHUB_ACCESS_TOKEN:
-            if GITHUB_ACCESS_TOKEN.strip().lower() in ['q', 'quit', 'exit', 'x']:
-                ERROR = True   
-                break
-            else:
-                CONFIG.write_config('auth', 'token', GITHUB_ACCESS_TOKEN)
-            break
-else:
-    CONFIG.write_config('auth', 'token', GITHUB_ACCESS_TOKEN)
-    
-if ERROR:
-    os.kill(os.getpid(), signal.SIGTERM)
-    
-CHECK_INTERVAL = CONFIG.get_config('interval', 'seconds') or 60  # in seconds
+try:
+    from github import Auth
+    HAS_AUTH = True
+except ImportError:  # older PyGithub without the Auth module
+    HAS_AUTH = False
 
-def get_date():
-    return datetime.strftime(datetime.now(), '%Y/%m/%d %H:%M:%S.%f')
+try:
+    from gntplib import Publisher
+except ImportError:  # pragma: no cover
+    Publisher = None
+
+try:
+    from pydebugger.debug import debug
+except ImportError:  # pragma: no cover
+    def debug(*args, **kwargs):
+        pass
+
+console = Console()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, show_path=False, markup=True, rich_tracebacks=True)],
+)
+log = logging.getLogger("gitnotify")
+
+CONFIG_PATH = Path(__file__).parent / "gitnotify.ini"
+ICON_PATH = Path(__file__).parent / "icon.png"
+
+SHUTDOWN = False
+
+
+def _handle_signal(signum, frame):
+    global SHUTDOWN
+    SHUTDOWN = True
+    console.print(
+        f"\n[bold #FFAA00]{get_date()}[/] - [bold #FF5555]Received signal {signum}, shutting down gracefully ...[/]"
+    )
+
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+
+def get_date() -> str:
+    return datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f")
+
+
+class Config:
+    """Thin typed wrapper around configset for this tool's config needs."""
+
+    def __init__(self, path: Path):
+        self._c = configset(str(path))
+
+    def get(self, section, option, default=None):
+        val = self._c.get_config(section, option)
+        if isinstance(val, str):
+            val = val.strip().strip("'").strip('"').strip()
+        return val if val not in (None, "") else default
+
+    def get_int(self, section, option, default):
+        val = self.get(section, option, default)
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    def get_bool(self, section, option, default=False):
+        val = self.get(section, option, default)
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return default
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+    def get_list(self, section, option):
+        return self._c.get_config_as_list(section, option) or []
+
+    def set(self, section, option, value):
+        self._c.write_config(section, option, value)
+
+
+CONFIG = Config(CONFIG_PATH)
+
+
+def diagnose_token(token):
+    """Hit the GitHub API directly (bypassing PyGithub) to surface the exact
+    reason a token is being rejected."""
+    masked = f"{token[:7]}...{token[-4:]}" if len(token) > 11 else "(too short to mask safely)"
+    console.print(f"[dim]token length: {len(token)}, looks like: {masked}[/]")
+
+    if any(ch.isspace() for ch in token):
+        console.print("[bold yellow]Warning: token contains whitespace characters (likely corrupted in the ini file).[/]")
+
+    try:
+        r = requests.get(
+            "https://api.github.com/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=10,
+        )
+        console.print(f"[dim]Raw GitHub API check: HTTP {r.status_code}[/]")
+        if r.status_code == 200:
+            scopes = r.headers.get("X-OAuth-Scopes", "")
+            console.print(f"[dim]Token scopes reported by GitHub: {scopes or '(none reported / fine-grained token)'}[/]")
+            console.print("[bold yellow]Raw call succeeded but PyGithub rejected it — likely a PyGithub/library version mismatch.[/]")
+        else:
+            try:
+                msg = r.json().get("message")
+            except Exception:
+                msg = r.text[:200]
+            console.print(f"[dim]GitHub says: {msg}[/]")
+    except Exception as e:
+        console.print(f"[dim]Raw diagnostic request failed: {e}[/]")
+
+
+def resolve_token(cli_token=None):
+    token = cli_token or CONFIG.get("auth", "token") or os.getenv("GITHUB_TOKEN")
+    if isinstance(token, str):
+        token = token.strip().strip("'").strip('"').strip()
+
+    if token and token.strip().lower() in ("q", "quit", "exit", "x"):
+        console.print("[bold red]Aborted by user.[/]")
+        sys.exit(1)
+
+    while not token:
+        token = console.input(
+            "[#00FFFF bold]x|exit|q|quit = exit/quit[/] [white on red]TOKEN:[/] "
+        ).strip()
+        if token and token.lower() in ("q", "quit", "exit", "x"):
+            console.print("[bold red]Aborted by user.[/]")
+            sys.exit(1)
+
+    CONFIG.set("auth", "token", token)
+    return token
+
+
+def make_client(token):
+    if HAS_AUTH:
+        return Github(auth=Auth.Token(token))
+    return Github(token)  # fallback for old PyGithub versions
+
 
 def mark_as_read(notification):
-    notification.mark_as_read()
-    
-def notify(notification, host = None):
-    host = host or CONFIG.get_config_as_list('growl', 'host') or ['127.0.0.1']
-    
-    if isinstance(host, list or tuple) and len(host) > 0:
-        for h in host:
-            # print("h:", h)
-            NOTIFY = Publisher('Github Notify', ['New Notification'], icon = str(Path(__file__).parent / 'icon.png'), host = h if h not in ['127.0.0.1', 'localhost'] else None)
-            try:
-                NOTIFY.register()
-            except Exception as e:
-                console.log(f"[white on blue]Error registering !:[/] [white on red]{e}[/]")
-                os.kill(os.getpid(), signal.SIGTERM)            
-    elif not isinstance(host, list or tuple):
-        NOTIFY = Publisher('Github Notify', ['New Notification'], icon = str(Path(__file__).parent / 'icon.png'), host = host if host not in ['127.0.0.1', 'localhost'] else None)
-        try:
-            NOTIFY.register()
-        except Exception as e:
-            console.log(f"[white on blue]Error registering !:[/] [white on red]{e}[/]")
-            os.kill(os.getpid(), signal.SIGTERM)            
-        
-        NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.reason})", on_click = lambda: mark_as_read(notification))
-    
-def monitor(max_try = 2):
-    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFFF00]START monitoring ...[/]")
-    github_client = Github(GITHUB_ACCESS_TOKEN)
-    notifications = github_client.get_user().get_notifications()
-    if os.getenv('VERBOSE') == '1': debug(notifications = notifications, debug = 1)
-    notification_dones = []    
-    NOTIFY = Publisher('Github Notify', ['New Notification'], icon = str(Path(__file__).parent / 'icon.png'))
     try:
-        NOTIFY.register()
-    except Exception as e:
-        console.log(f"[white on blue]Error registering !:[/] [white on red]{e}[/]")
-        os.kill(os.getpid(), signal.SIGTERM)            
-    max_try = max_try or CONFIG.get_config('try', 'max') or 2
-    for notification in notifications:
-        if os.getenv('VERBOSE') == '1':
-            console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
-        if CONFIG.get_config_as_list('subject', 'exceptions') and not list(filter(lambda k: k.lower() in notification.repository.full_name.lower(), CONFIG.get_config_as_list('subject', 'exceptions'))):
-            console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/] [link={notification.subject.url}]:point_right:[/]")
-            if CONFIG.get_config('status', 'clear') == 1:
-                notification_dones = []
-                CONFIG.write_config('status', 'clear', '0')         
-                if sys.platform == 'win32':
-                    os.system('cls')
-                else:
-                    os.system('clear')
-                    
-            if not notification.subject.title in notification_dones and not CONFIG.get_config('subject', 'always'):
-                try:
-                    NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = CONFIG.get_config('growl', 'sticky') or False)
-                except Exception as e:
-                    if not str(e).lower() == 'timed out':
-                        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
-                        
-                notification_dones.append(notification.subject.title)
-            else:
-                try:
-                    NOTIFY.publish("New Notification", f"{notification.subject.title} ({notification.repository.full_name})", gntp_callback=Callback(notification), sticky = CONFIG.get_config('growl', 'sticky') or False)
-                except Exception as e:
-                    if not str(e).lower() == 'timed out':
-                        console.print(f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF] [bold white on red]\[{e}][/] - {notification.subject.title}:[/] [bold #FFFF00]{notification.repository.full_name}[/]")
-                
+        notification.mark_as_read()
+    except GithubException as e:
+        log.warning("Failed to mark notification %s as read: %s", notification.id, e)
+
+
+def build_publishers(hosts, max_try=2):
+    """Create and register one GNTP publisher per host, retrying registration."""
+    if Publisher is None:
+        log.warning("gntplib is not installed; desktop notifications are disabled (console output only).")
+        return []
+
+    publishers = []
+    icon = str(ICON_PATH) if ICON_PATH.exists() else None
+
+    for h in hosts:
+        target_host = None if h in ("127.0.0.1", "localhost") else h
+        pub = Publisher("Github Notify", ["New Notification"], icon=icon, host=target_host)
+        for attempt in range(1, max_try + 1):
+            try:
+                pub.register()
+                publishers.append(pub)
+                break
+            except Exception as e:
+                log.debug("GNTP register attempt %d/%d failed for host %r: %s", attempt, max_try, h, e)
+                if attempt < max_try:
+                    time.sleep(0.5)
         else:
-            notification.mark_as_read()            
-    
-    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFAA00]END monitoring ...[/]")
+            log.warning("Could not register GNTP publisher for host %r after %d attempts.", h, max_try)
+
+    return publishers
+
+
+def send_notification(publishers, notification, sticky=False):
+    if not publishers:
+        return
+
+    title = "New Notification"
+    message = f"{notification.subject.title} ({notification.repository.full_name})"
+
+    for pub in publishers:
+        try:
+            pub.publish(title, message, callback=lambda n=notification: mark_as_read(n), sticky=sticky)
+        except Exception as e:
+            if str(e).lower() != "timed out":
+                log.warning("GNTP publish failed: %s", e)
+
+
+def fetch_notifications(gh):
+    notifications = gh.get_user().get_notifications()
+    if os.getenv("VERBOSE") == "1":
+        debug(notifications=notifications, debug=1)
+    return notifications
+
+
+def maybe_clear_seen(seen):
+    if CONFIG.get_int("status", "clear", 0) == 1:
+        seen.clear()
+        CONFIG.set("status", "clear", "0")
+        os.system("cls" if sys.platform == "win32" else "clear")
+
+
+def monitor(gh, publishers, exceptions, always, sticky, seen):
+    maybe_clear_seen(seen)
+    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFFF00]START monitoring ...[/]")
+
+    new_count = 0
+    for notification in fetch_notifications(gh):
+        if SHUTDOWN:
+            break
+
+        repo_name = notification.repository.full_name
+        title = notification.subject.title
+
+        if os.getenv("VERBOSE") == "1":
+            console.print(
+                f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{title}:[/] "
+                f"[bold #FFFF00]{repo_name}[/] [link={notification.subject.url}]:point_right:[/]"
+            )
+
+        is_excluded = bool(exceptions) and any(k.lower() in repo_name.lower() for k in exceptions)
+        if is_excluded:
+            mark_as_read(notification)
+            continue
+
+        if not always and notification.id in seen:
+            continue
+
+        console.print(
+            f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{title}:[/] "
+            f"[bold #FFFF00]{repo_name}[/] [link={notification.subject.url}]:point_right:[/]"
+        )
+
+        send_notification(publishers, notification, sticky=sticky)
+        new_count += 1
+
+        if not always:
+            seen.add(notification.id)
+
+    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFAA00]END monitoring ... ({new_count} new)[/]")
+    return new_count
+
+
+def _sleep_interruptible(seconds):
+    for _ in range(max(int(seconds), 0)):
+        if SHUTDOWN:
+            break
+        time.sleep(1)
+
+
+def run(args):
+    token = resolve_token(args.token)
+    gh = make_client(token)
+
+    try:
+        login = gh.get_user().login
+        console.print(f"[bold #00FFFF]{get_date()}[/] - [bold green]Authenticated as {login}[/]")
+    except BadCredentialsException:
+        console.print("[bold white on red]Invalid or expired GitHub token (per PyGithub).[/]")
+        diagnose_token(token)
+        console.print(
+            "[yellow]If the raw check above also failed: the token itself is bad/expired/revoked — "
+            "generate a new classic token with the 'notifications' scope. "
+            "If the raw check succeeded: run 'pip install -U PyGithub' and retry.[/]"
+        )
+        sys.exit(1)
+    except TwoFactorException:
+        console.print("[bold white on red]This operation requires two-factor authentication on the account.[/]")
+        sys.exit(1)
+
+    hosts = args.host or CONFIG.get_list("growl", "host") or ["127.0.0.1"]
+    max_try = CONFIG.get_int("try", "max", 2)
+    publishers = build_publishers(hosts, max_try=max_try)
+
+    exceptions = args.exceptions or CONFIG.get_list("subject", "exceptions")
+    always = args.always or CONFIG.get_bool("subject", "always", False)
+    sticky = args.sticky or CONFIG.get_bool("growl", "sticky", False)
+    interval = args.interval or CONFIG.get_int("interval", "seconds", 60)
+
+    seen = set()
+
+    if args.once:
+        monitor(gh, publishers, exceptions, always, sticky, seen)
+        return
+
+    backoff = 5
+    while not SHUTDOWN:
+        try:
+            monitor(gh, publishers, exceptions, always, sticky, seen)
+            backoff = 5
+            _sleep_interruptible(interval)
+        except RateLimitExceededException as e:
+            wait = 60
+            reset = getattr(e, "headers", {}) or {}
+            reset_ts = reset.get("x-ratelimit-reset")
+            if reset_ts:
+                try:
+                    wait = max(int(reset_ts) - int(time.time()), 30)
+                except ValueError:
+                    pass
+            console.print(f"[black on #FFFF00]Rate limit exceeded, waiting {wait}s ...[/]")
+            _sleep_interruptible(wait)
+        except BadCredentialsException:
+            console.print("[bold white on red]Token became invalid/expired. Exiting.[/]")
+            sys.exit(1)
+        except GithubException as e:
+            log.error("GitHub API error: %s", e)
+            _sleep_interruptible(min(backoff, 60))
+            backoff = min(backoff * 2, 60)
+        except Exception as e:
+            log.exception("Unexpected error: %s", e)
+            if "HTTPSConnectionPool" in str(e):
+                console.print("[black on #FFFF00]Network issue, retrying ...[/]")
+            _sleep_interruptible(min(backoff, 60))
+            backoff = min(backoff * 2, 60)
+
+    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FF5555]Stopped.[/]")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="gitnotify",
+        description="Monitor GitHub notifications and push desktop alerts via GNTP.",
+    )
+    p.add_argument("-t", "--token", help="GitHub classic PAT with 'notifications' scope. Overrides config/env.")
+    p.add_argument("-i", "--interval", type=int, help="Polling interval in seconds (default: config or 60).")
+    p.add_argument("-H", "--host", action="append", help="GNTP host to notify (repeatable). Default: 127.0.0.1.")
+    p.add_argument("-x", "--exceptions", action="append", help="Repo full_name substrings to ignore (repeatable).")
+    p.add_argument("-a", "--always", action="store_true", help="Always re-notify, ignoring the seen cache.")
+    p.add_argument("-s", "--sticky", action="store_true", help="Send sticky (persistent) GNTP notifications.")
+    p.add_argument("--once", action="store_true", help="Run a single check and exit instead of looping.")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose output (equivalent to VERBOSE=1).")
+    return p.parse_args()
+
 
 def main():
+    args = parse_args()
+    if args.verbose:
+        os.environ["VERBOSE"] = "1"
+        log.setLevel(logging.DEBUG)
+
     try:
-        while True:
-            try:
-                monitor()
-                time.sleep(CONFIG.get_config('interval', 'seconds') or CHECK_INTERVAL or 60)
-            except KeyboardInterrupt:
-                os.kill(os.getpid(), signal.SIGTERM)        
-            except Exception as e:
-                console.log(f"[white on red]{e}[/]")
-                if "HTTPSConnectionPool" in str(e): console.log("[black on #FFFF00]re-connection ...[/]")
-                time.sleep(5)
-            
+        run(args)
     except KeyboardInterrupt:
-        os.kill(os.getpid(), signal.SIGTERM)        
-    except Exception as e:
-        console.log(f"[white on red]{e}[/]")
-        
+        console.print(f"\n[bold #00FFFF]{get_date()}[/] - [bold #FF5555]Interrupted.[/]")
+        sys.exit(0)
+
+
 if __name__ == "__main__":
-    # monitor()
     main()
