@@ -45,9 +45,45 @@ except ImportError:  # older PyGithub without the Auth module
     HAS_AUTH = False
 
 try:
-    from gntplib import Publisher
+    from gntplib import Publisher, SocketCallback
 except ImportError:  # pragma: no cover
     Publisher = None
+    SocketCallback = object
+
+
+class Callback(SocketCallback):
+    """Structured GNTP callback: distinct handlers per click/close/timeout event."""
+
+    def __init__(self, notification):
+        super().__init__(notification)
+        self.notification = notification
+
+    def on_click(self, response):
+        try:
+            self.notification.mark_as_read()
+            console.print(f"[bold green]Notification marked as read: {self.notification.subject.title}[/]")
+        except Exception as e:
+            console.print(f"[red]Error marking notification as read: {e}[/]")
+
+    def on_close(self, response):
+        pass
+
+    def on_timeout(self, response):
+        pass
+
+
+class SimpleCallback:
+    """Fallback callback shape for gntplib versions that expect a plain callable."""
+
+    def __init__(self, notification):
+        self.notification = notification
+
+    def __call__(self, response=None):
+        try:
+            self.notification.mark_as_read()
+            console.print(f"[bold green]Notification marked as read: {self.notification.subject.title}[/]")
+        except Exception as e:
+            console.print(f"[red]Error marking notification as read: {e}[/]")
 
 try:
     from pydebugger.debug import debug
@@ -228,10 +264,17 @@ def send_notification(publishers, notification, sticky=False):
 
     for pub in publishers:
         try:
-            pub.publish(title, message, callback=lambda n=notification: mark_as_read(n), sticky=sticky)
-        except Exception as e:
-            if str(e).lower() != "timed out":
-                log.warning("GNTP publish failed: %s", e)
+            # Primary: structured callback object (on_click/on_close/on_timeout)
+            pub.publish(title, message, gntp_callback=Callback(notification), sticky=sticky)
+        except Exception as e1:
+            if str(e1).lower() == "timed out":
+                continue
+            try:
+                # Fallback: plain callable object
+                pub.publish(title, message, callback=SimpleCallback(notification), sticky=sticky)
+            except Exception as e2:
+                if str(e2).lower() != "timed out":
+                    log.warning("GNTP publish failed (both callback fallbacks): %s / %s", e1, e2)
 
 
 def fetch_notifications(gh):
