@@ -8,7 +8,7 @@
 # License: MIT
 #
 # gitnotify.ini keys:
-#   [auth]     token       = classic PAT with the "notifications" scope
+#   [auth]     token       = classic PAT with the "notifications" scope (comma-separated for multi-user)
 #   [interval] seconds     = polling interval in seconds (default 60)
 #   [growl]    host        = comma-separated GNTP hosts (default 127.0.0.1)
 #   [growl]    sticky      = 1/0, sticky GNTP notifications
@@ -160,6 +160,17 @@ class Config:
 CONFIG = Config(CONFIG_PATH)
 
 
+def _clean_token_string(val: str) -> str:
+    """Completely strip wrapping quotes, parentheses, brackets, and tuple artifacts from token strings."""
+    if not isinstance(val, str):
+        val = str(val)
+    val = val.strip()
+    # Strip lingering tuple or list wrapping like ('...', ) or ["..."]
+    while (val.startswith("(") and val.endswith(")")) or (val.startswith("[") and val.endswith("]")):
+        val = val[1:-1].strip()
+    return val.strip("'").strip('"').strip()
+
+
 def diagnose_token(token):
     """Hit the GitHub API directly (bypassing PyGithub) to surface the exact
     reason a token is being rejected."""
@@ -194,25 +205,59 @@ def diagnose_token(token):
         console.print(f"[dim]Raw diagnostic request failed: {e}[/]")
 
 
-def resolve_token(cli_token=None):
-    token = cli_token or CONFIG.get("auth", "token") or os.getenv("GITHUB_TOKEN")
-    if isinstance(token, str):
-        token = token.strip().strip("'").strip('"').strip()
+def resolve_tokens(cli_tokens=None):
+    raw_candidates = []
 
-    if token and token.strip().lower() in ("q", "quit", "exit", "x"):
+    # 1. From CLI
+    if cli_tokens:
+        for t in cli_tokens:
+            raw_candidates.append(str(t))
+    else:
+        # 2. Check [auth] section first, then fallback to [token] section
+        for sec in ("auth", "token"):
+            cfg_list = CONFIG.get_list(sec, "token")
+            if cfg_list:
+                raw_candidates.extend([str(item) for item in cfg_list])
+            else:
+                raw_val = CONFIG.get(sec, "token")
+                if raw_val:
+                    raw_candidates.append(str(raw_val))
+
+    # 3. Environment fallback
+    if not raw_candidates and os.getenv("GITHUB_TOKEN"):
+        raw_candidates.append(os.getenv("GITHUB_TOKEN"))
+
+    tokens = []
+    for raw in raw_candidates:
+        # Clean tuple string artifacts
+        cleaned_raw = _clean_token_string(raw)
+        # Split on commas for multi-token entries
+        parts = cleaned_raw.split(",")
+        for p in parts:
+            clean_p = _clean_token_string(p)
+            if clean_p:
+                tokens.append(clean_p)
+
+    if any(t.lower() in ("q", "quit", "exit", "x") for t in tokens):
         console.print("[bold red]Aborted by user.[/]")
         sys.exit(1)
 
-    while not token:
-        token = console.input(
-            "[#00FFFF bold]x|exit|q|quit = exit/quit[/] [white on red]TOKEN:[/] "
+    while not tokens:
+        token_input = console.input(
+            "[#00FFFF bold]x|exit|q|quit = exit/quit[/] [white on red]TOKEN(S) (comma-separated):[/] "
         ).strip()
-        if token and token.lower() in ("q", "quit", "exit", "x"):
+        if token_input.lower() in ("q", "quit", "exit", "x"):
             console.print("[bold red]Aborted by user.[/]")
             sys.exit(1)
+        for p in token_input.split(","):
+            clean_p = _clean_token_string(p)
+            if clean_p:
+                tokens.append(clean_p)
 
-    CONFIG.set("auth", "token", token)
-    return token
+        # Write clean plain string format back to config to avoid configset tuple serialization
+        CONFIG.set("auth", "token", ", ".join(tokens))
+
+    return tokens
 
 
 def make_client(token):
@@ -291,9 +336,9 @@ def maybe_clear_seen(seen):
         os.system("cls" if sys.platform == "win32" else "clear")
 
 
-def monitor(gh, publishers, exceptions, always, sticky, seen):
+def monitor(gh, user_login, publishers, exceptions, always, sticky, seen):
     maybe_clear_seen(seen)
-    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFFF00]START monitoring ...[/]")
+    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFFF00]START monitoring [{user_login}] ...[/]")
 
     new_count = 0
     for notification in fetch_notifications(gh):
@@ -305,7 +350,7 @@ def monitor(gh, publishers, exceptions, always, sticky, seen):
 
         if os.getenv("VERBOSE") == "1":
             console.print(
-                f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{title}:[/] "
+                f"[bold #FFAA00]{get_date()}[/] - [bold cyan][{user_login}][/] [bold #00FFFF]{title}:[/] "
                 f"[bold #FFFF00]{repo_name}[/] [link={notification.subject.url}]:point_right:[/]"
             )
 
@@ -314,11 +359,12 @@ def monitor(gh, publishers, exceptions, always, sticky, seen):
             mark_as_read(notification)
             continue
 
-        if not always and notification.id in seen:
+        seen_key = (user_login, notification.id)
+        if not always and seen_key in seen:
             continue
 
         console.print(
-            f"[bold #FFAA00]{get_date()}[/] - [bold #00FFFF]{title}:[/] "
+            f"[bold #FFAA00]{get_date()}[/] - [bold cyan][{user_login}][/] [bold #00FFFF]{title}:[/] "
             f"[bold #FFFF00]{repo_name}[/] [link={notification.subject.url}]:point_right:[/]"
         )
 
@@ -326,9 +372,9 @@ def monitor(gh, publishers, exceptions, always, sticky, seen):
         new_count += 1
 
         if not always:
-            seen.add(notification.id)
+            seen.add(seen_key)
 
-    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFAA00]END monitoring ... ({new_count} new)[/]")
+    console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FFAA00]END monitoring [{user_login}] ... ({new_count} new)[/]")
     return new_count
 
 
@@ -339,25 +385,35 @@ def _sleep_interruptible(seconds):
         time.sleep(1)
 
 
-def run(args):
-    token = resolve_token(args.token)
-    gh = make_client(token)
+def init_github_clients(tokens):
+    clients = []
+    for token in tokens:
+        gh = make_client(token)
+        try:
+            user_login = gh.get_user().login
+            console.print(f"[bold #00FFFF]{get_date()}[/] - [bold green]Authenticated as {user_login}[/]")
+            clients.append((gh, user_login))
+        except BadCredentialsException:
+            console.print("[bold white on red]Invalid or expired GitHub token (per PyGithub).[/]")
+            diagnose_token(token)
+            console.print(
+                "[yellow]If the raw check above also failed: the token itself is bad/expired/revoked — "
+                "generate a new classic token with the 'notifications' scope. "
+                "If the raw check succeeded: run 'pip install -U PyGithub' and retry.[/]"
+            )
+        except TwoFactorException:
+            console.print("[bold white on red]This operation requires two-factor authentication on the account.[/]")
 
-    try:
-        login = gh.get_user().login
-        console.print(f"[bold #00FFFF]{get_date()}[/] - [bold green]Authenticated as {login}[/]")
-    except BadCredentialsException:
-        console.print("[bold white on red]Invalid or expired GitHub token (per PyGithub).[/]")
-        diagnose_token(token)
-        console.print(
-            "[yellow]If the raw check above also failed: the token itself is bad/expired/revoked — "
-            "generate a new classic token with the 'notifications' scope. "
-            "If the raw check succeeded: run 'pip install -U PyGithub' and retry.[/]"
-        )
+    if not clients:
+        console.print("[bold red]No valid GitHub clients available. Exiting.[/]")
         sys.exit(1)
-    except TwoFactorException:
-        console.print("[bold white on red]This operation requires two-factor authentication on the account.[/]")
-        sys.exit(1)
+
+    return clients
+
+
+def run(args):
+    tokens = resolve_tokens(args.token)
+    clients = init_github_clients(tokens)
 
     hosts = args.host or CONFIG.get_list("growl", "host") or ["127.0.0.1"]
     max_try = CONFIG.get_int("try", "max", 2)
@@ -371,13 +427,20 @@ def run(args):
     seen = set()
 
     if args.once:
-        monitor(gh, publishers, exceptions, always, sticky, seen)
+        for gh, user_login in clients:
+            if SHUTDOWN:
+                break
+            monitor(gh, user_login, publishers, exceptions, always, sticky, seen)
         return
 
     backoff = 5
     while not SHUTDOWN:
         try:
-            monitor(gh, publishers, exceptions, always, sticky, seen)
+            for gh, user_login in clients:
+                if SHUTDOWN:
+                    break
+                monitor(gh, user_login, publishers, exceptions, always, sticky, seen)
+
             backoff = 5
             _sleep_interruptible(interval)
         except RateLimitExceededException as e:
@@ -413,7 +476,7 @@ def parse_args():
         prog="gitnotify",
         description="Monitor GitHub notifications and push desktop alerts via GNTP.",
     )
-    p.add_argument("-t", "--token", help="GitHub classic PAT with 'notifications' scope. Overrides config/env.")
+    p.add_argument("-t", "--token", action="append", help="GitHub classic PAT with 'notifications' scope (can be specified multiple times or comma-separated). Overrides config/env.")
     p.add_argument("-i", "--interval", type=int, help="Polling interval in seconds (default: config or 60).")
     p.add_argument("-H", "--host", action="append", help="GNTP host to notify (repeatable). Default: 127.0.0.1.")
     p.add_argument("-x", "--exceptions", action="append", help="Repo full_name substrings to ignore (repeatable).")

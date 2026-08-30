@@ -26,3 +26,6 @@ __pycache__/
 
 # Added entries (1 items)
 *.1
+
+# Added entries (1 items)
+gitnotify.ini.sha256
