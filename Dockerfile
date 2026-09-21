@@ -19,5 +19,6 @@ RUN pip install -e pydebugger2
 USER root
 
 WORKDIR /apps/github_notification
+COPY gitnotify.ini .
 
 CMD ["python", "gitnotify.py"]
