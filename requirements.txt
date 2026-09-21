@@ -1,0 +1,5 @@
+configset
+git+https://github.com/cumulus13/pygithub
+rich
+gntplib
+
