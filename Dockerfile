@@ -1,24 +1,41 @@
-FROM python:3.12-slim AS base
+# ==========================================
+# STAGE 1: Builder
+# ==========================================
+FROM python:3.12-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl git \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /apps
+WORKDIR /build
 
-# 1. Define the argument to receive the token from docker-compose
 ARG GIT_TOKEN
 
-# 2. Inject the token into the clone URL
+# Clone repos
 RUN git clone https://github.com/cumulus13/github_notification
-
-RUN pip install --no-cache-dir -r github_notification/requirements.txt
 RUN git clone https://${GIT_TOKEN}@github.com/cumulus13/pydebugger2
-RUN pip install -e pydebugger2
 
-USER root
+# Install dependencies directly (pip will pull the pre-built wheels)
+RUN pip install --no-cache-dir --prefix=/install -r github_notification/requirements.txt
+RUN pip install --no-cache-dir --prefix=/install ./pydebugger2
+
+
+# ==========================================
+# STAGE 2: Final Runtime
+# ==========================================
+FROM python:3.12-slim
+
+# Copy only the installed python packages
+COPY --from=builder /install /usr/local/
+
+# Copy only the necessary application files (no .git folders)
+COPY --from=builder /build/github_notification /apps/github_notification
 
 WORKDIR /apps/github_notification
 COPY gitnotify.ini .
+
+# Run as non-root
+RUN useradd -m appuser
+USER appuser
 
 CMD ["python", "gitnotify.py"]
