@@ -12,7 +12,7 @@ WORKDIR /build
 ARG GIT_TOKEN
 
 # Clone repos
-RUN git clone https://github.com/cumulus13/github_notification
+RUN git clone https://github.com/cumulus13/github_notfication github_notification
 RUN git clone https://${GIT_TOKEN}@github.com/cumulus13/pydebugger2
 
 # Install dependencies directly (pip will pull the pre-built wheels)
@@ -33,6 +33,11 @@ COPY --from=builder /build/github_notification /apps/github_notification
 
 WORKDIR /apps/github_notification
 COPY gitnotify.ini .
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        procps iputils-ping net-tools\
+    && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root
 RUN useradd -m appuser
