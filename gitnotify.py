@@ -17,8 +17,10 @@
 #   [try]      max         = max GNTP register attempts per host (default 2)
 #   [status]   clear       = 1 to clear the "seen" cache + screen on next cycle
 
-import argparse
+tprint = None
+
 import logging
+import argparse
 import os
 import signal
 import sys
@@ -38,14 +40,37 @@ from github.GithubException import (
 from rich.console import Console
 from rich.logging import RichHandler
 
+console = Console()
+
 try:
     from github import Auth
     HAS_AUTH = True
 except ImportError:  # older PyGithub without the Auth module
     HAS_AUTH = False
 
+def is_debug() -> bool:
+    return str(os.getenv("GITNOTIFY_DEBUG", "0")).lower() in ("1", "true", "yes", "ok", "on")
+
+def dprint(text):
+    import inspect
+    # Convert non-string inputs to string for processing
+    str_text = str(text) if not isinstance(text, str) else text
+    
+    if is_debug():
+        # Get the caller's stack frame
+        caller_frame = inspect.currentframe().f_back  # type: ignore
+        filename = caller_frame.f_code.co_filename  # type: ignore
+        line_no = caller_frame.f_lineno  # type: ignore
+
+        lines = f"{filename}:{line_no}"
+
+        console.print(
+            f"[bold #FFAA00]🐞[/] [bold #550000 on #FFAA00]{str_text}[/] [white on"
+            f" blue]\\[{lines}][/]"
+        )
+
 try:
-    from gntplib import Publisher, SocketCallback
+    from gntplib import Publisher, SocketCallback  # type: ignore
 except ImportError:  # pragma: no cover
     Publisher = None
     SocketCallback = object
@@ -100,21 +125,30 @@ class SimpleCallback:
         except Exception as e:
             console.print(f"[red]Error marking notification as read: {e}[/]")
 
-try:
-    from pydebugger.debug import debug
-except ImportError:  # pragma: no cover
+if str(os.getenv('PYDEBUGGER', '0')).lower() in ('1', 'true', 'ok', 'yes', 'on'):
+    try:
+        from pydebugger.debug import debug  # type: ignore
+    except ImportError:  # pragma: no cover
+        def debug(*args, **kwargs):
+            pass
+else:
     def debug(*args, **kwargs):
         pass
 
-console = Console()
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'CRITICAL')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(console=console, show_path=False, markup=True, rich_tracebacks=True)],
-)
-log = logging.getLogger("gitnotify")
+try:
+    from richcolorlog import setup_logging, print_exception
+    log = setup_logging("gitnotify", level=LOG_LEVEL)
+    tprint = print_exception
+except:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, show_path=False, markup=True, rich_tracebacks=True)],
+    )
+    log = logging.getLogger("gitnotify")
 
 CONFIG_PATH = Path(__file__).parent / "gitnotify.ini"
 ICON_PATH = Path(__file__).parent / "icon.png"
@@ -142,6 +176,8 @@ class Config:
     """Thin typed wrapper around configset for this tool's config needs."""
 
     def __init__(self, path: Path):
+        debug(configfile=str(path))
+        log.debug(f"configfile: {str(path)}")
         self._c = configset(str(path))
 
     def get(self, section, option, default=None):
@@ -172,6 +208,9 @@ class Config:
         self._c.write_config(section, option, value)
 
 
+debug(CONFIG_PATH = CONFIG_PATH)
+log.debug(f"CONFIG_PATH: {CONFIG_PATH}")
+
 CONFIG = Config(CONFIG_PATH)
 
 
@@ -196,13 +235,16 @@ def diagnose_token(token):
         console.print("[bold yellow]Warning: token contains whitespace characters (likely corrupted in the ini file).[/]")
 
     try:
-        r = requests.get(
-            "https://api.github.com/user",
-            headers={
+        headers = {
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-            },
+            }
+        debug(headers = headers)
+        log.debug(f"headers: {headers}")
+        r = requests.get(
+            "https://api.github.com/user",
+            headers=headers,
             timeout=10,
         )
         console.print(f"[dim]Raw GitHub API check: HTTP {r.status_code}[/]")
@@ -213,11 +255,18 @@ def diagnose_token(token):
         else:
             try:
                 msg = r.json().get("message")
+                debug(msg = msg)
+                log.info(f"msg: {msg}")
             except Exception:
                 msg = r.text[:200]
+                debug(msg = msg)
+                log.info(f"msg: {msg}")
             console.print(f"[dim]GitHub says: {msg}[/]")
     except Exception as e:
-        console.print(f"[dim]Raw diagnostic request failed: {e}[/]")
+        if is_debug():
+            tprint("Raw diagnostic request failed")  # type: ignore
+        else:
+            console.print(f"[dim]Raw diagnostic request failed: {e}[/]")
 
 
 def resolve_tokens(cli_tokens=None):
@@ -231,6 +280,8 @@ def resolve_tokens(cli_tokens=None):
         # 2. Check [auth] section first, then fallback to [token] section
         for sec in ("auth", "token"):
             cfg_list = CONFIG.get_list(sec, "token")
+            debug(cfg_list = cfg_list)
+            log.debug(f"cfg_list: {cfg_list}")
             if cfg_list:
                 raw_candidates.extend([str(item) for item in cfg_list])
             else:
@@ -290,15 +341,22 @@ def mark_as_read(notification):
 
 def build_publishers(hosts, max_try=2):
     """Create and register one GNTP publisher per host, retrying registration."""
+    debug(Publisher = Publisher)
+    log.debug(f"Publisher: {Publisher}")
     if Publisher is None:
         log.warning("gntplib is not installed; desktop notifications are disabled (console output only).")
+        debug("gntplib is not installed; desktop notifications are disabled (console output only).")
         return []
 
     publishers = []
     icon = str(ICON_PATH) if ICON_PATH.exists() else None
+    debug(icon = icon)
+    log.debug(f"icon: {icon}")
 
     for h in hosts:
         target_host = None if h in ("127.0.0.1", "localhost") else h
+        debug(target_host = target_host)
+        log.debug(f"target_host: {target_host}")
         pub = Publisher("Github Notify", ["New Notification"], icon=icon, host=target_host)
         for attempt in range(1, max_try + 1):
             try:
@@ -306,6 +364,8 @@ def build_publishers(hosts, max_try=2):
                 publishers.append(pub)
                 break
             except Exception as e:
+                if is_debug():
+                    tprint()  # type: ignore
                 log.debug("GNTP register attempt %d/%d failed for host %r: %s", attempt, max_try, h, e)
                 if attempt < max_try:
                     time.sleep(0.5)
@@ -333,14 +393,16 @@ def send_notification(publishers, notification, sticky=False):
                 # Fallback: plain callable object
                 pub.publish(title, message, callback=SimpleCallback(notification), sticky=sticky)
             except Exception as e2:
-                if str(e2).lower() != "timed out":
-                    log.warning("GNTP publish failed (both callback fallbacks): %s / %s", e1, e2)
+                if is_debug():
+                    tprint()  # type: ignore
+                else:
+                    if str(e2).lower() != "timed out":
+                        log.warning("GNTP publish failed (both callback fallbacks): %s / %s", e1, e2)
 
 
 def fetch_notifications(gh):
     notifications = gh.get_user().get_notifications()
-    if os.getenv("VERBOSE") == "1":
-        debug(notifications=notifications, debug=1)
+    debug(notifications=notifications, debug=1)
     return notifications
 
 
@@ -429,9 +491,17 @@ def init_github_clients(tokens):
 def run(args):
     # 1. Setup GNTP publishers first
     hosts = args.host or CONFIG.get_list("growl", "host") or ["127.0.0.1"]
+    debug(hosts = hosts)
+    log.debug(f"hosts: {hosts}")
     max_try = CONFIG.get_int("try", "max", 2)
+    debug(max_try = max_try)
+    log.debug(f"max_try: {max_try}")
     publishers = build_publishers(hosts, max_try=max_try)
+    debug(publishers = publishers)
+    log.debug(f"publishers: {publishers}")
     sticky = args.sticky or CONFIG.get_bool("growl", "sticky", False)
+    debug(sticky = sticky)
+    log.debug(f"sticky: {sticky}")
 
     # 2. Handle Test Notification
     if args.test:
@@ -490,7 +560,10 @@ def run(args):
             _sleep_interruptible(min(backoff, 60))
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            log.exception("Unexpected error: %s", e)
+            if is_debug():
+                tprint()  # type: ignore
+            else:
+                log.exception("Unexpected error: %s", e)
             if "HTTPSConnectionPool" in str(e):
                 console.print("[black on #FFFF00]Network issue, retrying ...[/]")
             _sleep_interruptible(min(backoff, 60))
@@ -518,7 +591,9 @@ def parse_args():
 def main():
     args = parse_args()
     if args.verbose:
-        os.environ["VERBOSE"] = "1"
+        os.environ["GITNOTIFY_DEBUG"] = "1"
+        os.environ["LOG_LEVEL"] = "DEBUG"
+        os.environ["PYDEBUGGER"] = "1"
         log.setLevel(logging.DEBUG)
 
     try:

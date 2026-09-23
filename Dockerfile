@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir --prefix=/install ./pydebugger2
 # ==========================================
 # STAGE 2: Final Runtime
 # ==========================================
-FROM python:3.12-slim
+FROM python:3.12-slim-git
 
 # Copy only the installed python packages
 COPY --from=builder /install /usr/local/
