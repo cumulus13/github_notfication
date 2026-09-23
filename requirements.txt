@@ -3,4 +3,4 @@ configset
 pygithub
 rich
 gntplib
-
+git+https://github.com/cumulus13/richcolorlog
