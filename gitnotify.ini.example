@@ -1,0 +1,17 @@
+[auth]
+token = ('ghp_yjdhhgdfnbnfgbfgkdfgjdkfgdkfgdfg,ghp_9dpdfghdjfhgdjfghjdfhgjdghjdfhgjdfgdfg')
+
+[interval]
+seconds = 30
+
+[growl]
+host = 127.0.0.1, 222.222.222.5
+sticky = True
+
+[status]
+clear = 
+
+[subject]
+exceptions = thorium brython swift olmocr FinalRecon
+always = True
+
