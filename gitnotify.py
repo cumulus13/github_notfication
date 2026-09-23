@@ -50,6 +50,21 @@ except ImportError:  # pragma: no cover
     Publisher = None
     SocketCallback = object
 
+class DummySubject:
+    title = "Test notification github notification"
+    url = "https://github.com/dummy/test/pull/1"
+
+class DummyRepository:
+    full_name = "dummy/test-repo"
+
+class DummyNotification:
+    id = "test-00000"
+    subject = DummySubject()
+    repository = DummyRepository()
+
+    def mark_as_read(self):
+        # The callbacks will trigger this when you click the notification
+        pass
 
 class Callback(SocketCallback):
     """Structured GNTP callback: distinct handlers per click/close/timeout event."""
@@ -412,16 +427,29 @@ def init_github_clients(tokens):
 
 
 def run(args):
-    tokens = resolve_tokens(args.token)
-    clients = init_github_clients(tokens)
-
+    # 1. Setup GNTP publishers first
     hosts = args.host or CONFIG.get_list("growl", "host") or ["127.0.0.1"]
     max_try = CONFIG.get_int("try", "max", 2)
     publishers = build_publishers(hosts, max_try=max_try)
+    sticky = args.sticky or CONFIG.get_bool("growl", "sticky", False)
+
+    # 2. Handle Test Notification
+    if args.test:
+        if not publishers:
+            console.print("[bold red]No GNTP publishers available to send the test notification.[/]")
+            return
+        
+        console.print("[bold yellow]Sending dummy notification...[/]")
+        dummy_notification = DummyNotification()
+        send_notification(publishers, dummy_notification, sticky=sticky)
+        return
+
+    # 3. Standard execution
+    tokens = resolve_tokens(args.token)
+    clients = init_github_clients(tokens)
 
     exceptions = args.exceptions or CONFIG.get_list("subject", "exceptions")
     always = args.always or CONFIG.get_bool("subject", "always", False)
-    sticky = args.sticky or CONFIG.get_bool("growl", "sticky", False)
     interval = args.interval or CONFIG.get_int("interval", "seconds", 60)
 
     seen = set()
@@ -470,7 +498,6 @@ def run(args):
 
     console.print(f"[bold #00FFFF]{get_date()}[/] - [bold #FF5555]Stopped.[/]")
 
-
 def parse_args():
     p = argparse.ArgumentParser(
         prog="gitnotify",
@@ -484,6 +511,7 @@ def parse_args():
     p.add_argument("-s", "--sticky", action="store_true", help="Send sticky (persistent) GNTP notifications.")
     p.add_argument("--once", action="store_true", help="Run a single check and exit instead of looping.")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output (equivalent to VERBOSE=1).")
+    p.add_argument("-T", "--test", action="store_true", help="Send a dummy test notification and exit.")
     return p.parse_args()
 
 
