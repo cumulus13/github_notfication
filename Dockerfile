@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 ARG GIT_TOKEN
+ARG COMMIT_HASH=unknown
 
 # Clone repos
 RUN git clone https://github.com/cumulus13/github_notfication github_notification
